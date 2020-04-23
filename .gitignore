@@ -100,6 +100,6 @@ R-package/src/Makevars
 .idea
 *.iml
 /cmake-build-debug/
-
+/cmake-build-debug-316/
 # GDB
 .gdb_history

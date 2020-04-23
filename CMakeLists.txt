@@ -1,3 +1,5 @@
+# openMp: https://www.codenong.com/48825416/
+
 cmake_minimum_required(VERSION 3.13)
 project(xgboost LANGUAGES CXX C VERSION 1.1.0)
 include(cmake/Utils.cmake)
