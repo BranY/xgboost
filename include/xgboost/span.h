@@ -30,6 +30,7 @@
 #define XGBOOST_SPAN_H_
 
 #include <xgboost/base.h>
+#include <xgboost/logging.h>
 
 #include <cinttypes>          // size_t
 #include <limits>             // numeric_limits
@@ -85,9 +86,11 @@ namespace common {
     }                                                                          \
   } while (0);
 
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__)
 #define SPAN_CHECK KERNEL_CHECK
-#else
+#elif defined(XGBOOST_STRICT_R_MODE) && XGBOOST_STRICT_R_MODE == 1  // R package
+#define SPAN_CHECK CHECK  // check from dmlc
+#else  // not CUDA, not R
 #define SPAN_CHECK(cond)                                                       \
   do {                                                                         \
     if (XGBOOST_EXPECT(!(cond), false)) {                                      \
@@ -570,8 +573,8 @@ class Span {
   XGBOOST_DEVICE auto subspan() const ->                   // NOLINT
       Span<element_type,
            detail::ExtentValue<Extent, Offset, Count>::value> {
-    SPAN_CHECK(Offset < size() || size() == 0);
-    SPAN_CHECK(Count == dynamic_extent || (Offset + Count <= size()));
+    SPAN_CHECK((Count == dynamic_extent) ?
+               (Offset <= size()) : (Offset + Count <= size()));
 
     return {data() + Offset, Count == dynamic_extent ? size() - Offset : Count};
   }
@@ -579,9 +582,8 @@ class Span {
   XGBOOST_DEVICE Span<element_type, dynamic_extent> subspan(  // NOLINT
       index_type _offset,
       index_type _count = dynamic_extent) const {
-    SPAN_CHECK(_offset < size() || size() == 0);
-    SPAN_CHECK((_count == dynamic_extent) || (_offset + _count <= size()));
-
+    SPAN_CHECK((_count == dynamic_extent) ?
+               (_offset <= size()) : (_offset + _count <= size()));
     return {data() + _offset, _count ==
             dynamic_extent ? size() - _offset : _count};
   }

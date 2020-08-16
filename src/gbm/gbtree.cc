@@ -62,6 +62,14 @@ void GBTree::Configure(const Args& cfg) {
   }
 #endif  // defined(XGBOOST_USE_CUDA)
 
+#if defined(XGBOOST_USE_ONEAPI)
+  if (!oneapi_predictor_) {
+    oneapi_predictor_ = std::unique_ptr<Predictor>(
+        Predictor::Create("oneapi_predictor", this->generic_param_));
+  }
+  oneapi_predictor_->Configure(cfg);
+#endif  // defined(XGBOOST_USE_ONEAPI)
+
   monitor_.Init("GBTree");
 
   specified_updater_ = std::any_of(cfg.cbegin(), cfg.cend(),
@@ -407,11 +415,20 @@ GBTree::GetPredictor(HostDeviceVector<float> const *out_pred,
   if (tparam_.predictor != PredictorType::kAuto) {
     if (tparam_.predictor == PredictorType::kGPUPredictor) {
 #if defined(XGBOOST_USE_CUDA)
+      CHECK_GE(common::AllVisibleGPUs(), 1) << "No visible GPU is found for XGBoost.";
       CHECK(gpu_predictor_);
       return gpu_predictor_;
 #else
       common::AssertGPUSupport();
 #endif  // defined(XGBOOST_USE_CUDA)
+    }
+    if (tparam_.predictor == PredictorType::kOneAPIPredictor) {
+#if defined(XGBOOST_USE_ONEAPI)
+      CHECK(oneapi_predictor_);
+      return oneapi_predictor_;
+#else
+      common::AssertOneAPISupport();
+#endif  // defined(XGBOOST_USE_ONEAPI)
     }
     CHECK(cpu_predictor_);
     return cpu_predictor_;
@@ -429,6 +446,7 @@ GBTree::GetPredictor(HostDeviceVector<float> const *out_pred,
   // Use GPU Predictor if data is already on device and gpu_id is set.
   if (on_device && generic_param_->gpu_id >= 0) {
 #if defined(XGBOOST_USE_CUDA)
+    CHECK_GE(common::AllVisibleGPUs(), 1) << "No visible GPU is found for XGBoost.";
     CHECK(gpu_predictor_);
     return gpu_predictor_;
 #else
@@ -454,6 +472,7 @@ GBTree::GetPredictor(HostDeviceVector<float> const *out_pred,
 
   if (tparam_.tree_method == TreeMethod::kGPUHist) {
 #if defined(XGBOOST_USE_CUDA)
+    CHECK_GE(common::AllVisibleGPUs(), 1) << "No visible GPU is found for XGBoost.";
     CHECK(gpu_predictor_);
     return gpu_predictor_;
 #else

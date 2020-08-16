@@ -20,6 +20,15 @@
 #include "../../src/gbm/gbtree_model.h"
 #include "xgboost/predictor.h"
 
+#if defined(XGBOOST_USE_RMM) && XGBOOST_USE_RMM == 1
+#include <memory>
+#include <numeric>
+#include <vector>
+#include "rmm/mr/device/per_device_resource.hpp"
+#include "rmm/mr/device/cuda_memory_resource.hpp"
+#include "rmm/mr/device/pool_memory_resource.hpp"
+#endif  // defined(XGBOOST_USE_RMM) && XGBOOST_USE_RMM == 1
+
 bool FileExists(const std::string& filename) {
   struct stat st;
   return stat(filename.c_str(), &st) == 0;
@@ -156,10 +165,10 @@ SimpleLCG::StateType SimpleLCG::Max() const {
 }
 
 void RandomDataGenerator::GenerateDense(HostDeviceVector<float> *out) const {
-  SimpleLCG lcg{seed_};
   xgboost::SimpleRealUniformDistribution<bst_float> dist(lower_, upper_);
   CHECK(out);
 
+  SimpleLCG lcg{lcg_};
   out->Resize(rows_ * cols_, 0);
   auto &h_data = out->HostVector();
   float sparsity = sparsity_ * (upper_ - lower_) + lower_;
@@ -182,7 +191,13 @@ Json RandomDataGenerator::ArrayInterfaceImpl(HostDeviceVector<float> *storage,
   this->GenerateDense(storage);
   Json array_interface {Object()};
   array_interface["data"] = std::vector<Json>(2);
-  array_interface["data"][0] = Integer(reinterpret_cast<int64_t>(storage->DevicePointer()));
+  if (storage->DeviceCanRead()) {
+    array_interface["data"][0] =
+        Integer(reinterpret_cast<int64_t>(storage->ConstDevicePointer()));
+  } else {
+    array_interface["data"][0] =
+        Integer(reinterpret_cast<int64_t>(storage->ConstHostPointer()));
+  }
   array_interface["data"][1] = Boolean(false);
 
   array_interface["shape"] = std::vector<Json>(2);
@@ -202,7 +217,56 @@ std::string RandomDataGenerator::GenerateArrayInterface(
   return out;
 }
 
+std::pair<std::vector<std::string>, std::string>
+RandomDataGenerator::GenerateArrayInterfaceBatch(
+    HostDeviceVector<float> *storage, size_t batches) const {
+  this->GenerateDense(storage);
+  std::vector<std::string> result(batches);
+  std::vector<Json> objects;
 
+  size_t const rows_per_batch = rows_ / batches;
+
+  auto make_interface = [storage, this](size_t offset, size_t rows) {
+    Json array_interface{Object()};
+    array_interface["data"] = std::vector<Json>(2);
+    if (device_ >= 0) {
+      array_interface["data"][0] =
+          Integer(reinterpret_cast<int64_t>(storage->DevicePointer() + offset));
+    } else {
+      array_interface["data"][0] =
+          Integer(reinterpret_cast<int64_t>(storage->HostPointer() + offset));
+    }
+
+    array_interface["data"][1] = Boolean(false);
+
+    array_interface["shape"] = std::vector<Json>(2);
+    array_interface["shape"][0] = rows;
+    array_interface["shape"][1] = cols_;
+
+    array_interface["typestr"] = String("<f4");
+    array_interface["version"] = 1;
+    return array_interface;
+  };
+
+  auto j_interface = make_interface(0, rows_);
+  size_t offset = 0;
+  for (size_t i = 0; i < batches - 1; ++i) {
+    objects.emplace_back(make_interface(offset, rows_per_batch));
+    offset += rows_per_batch * cols_;
+  }
+
+  size_t const remaining = rows_ - offset / cols_;
+  CHECK_LE(offset, rows_ * cols_);
+  objects.emplace_back(make_interface(offset, remaining));
+
+  for (size_t i = 0; i < batches; ++i) {
+    Json::Dump(objects[i], &result[i]);
+  }
+
+  std::string interface_str;
+  Json::Dump(j_interface, &interface_str);
+  return {result, interface_str};
+}
 
 std::string RandomDataGenerator::GenerateColumnarArrayInterface(
     std::vector<HostDeviceVector<float>> *data) const {
@@ -225,8 +289,8 @@ void RandomDataGenerator::GenerateCSR(
   auto& h_value = value->HostVector();
   auto& h_rptr = row_ptr->HostVector();
   auto& h_cols = columns->HostVector();
+  SimpleLCG lcg{lcg_};
 
-  SimpleLCG lcg{seed_};
   xgboost::SimpleRealUniformDistribution<bst_float> dist(lower_, upper_);
   float sparsity = sparsity_ * (upper_ - lower_) + lower_;
 
@@ -422,5 +486,58 @@ std::unique_ptr<GradientBooster> CreateTrainedGBM(
 
   return gbm;
 }
+
+#if defined(XGBOOST_USE_RMM) && XGBOOST_USE_RMM == 1
+
+using CUDAMemoryResource = rmm::mr::cuda_memory_resource;
+using PoolMemoryResource = rmm::mr::pool_memory_resource<CUDAMemoryResource>;
+class RMMAllocator {
+ public:
+  std::vector<std::unique_ptr<CUDAMemoryResource>> cuda_mr;
+  std::vector<std::unique_ptr<PoolMemoryResource>> pool_mr;
+  int n_gpu;
+  RMMAllocator() : n_gpu(common::AllVisibleGPUs()) {
+    int current_device;
+    CHECK_EQ(cudaGetDevice(&current_device), cudaSuccess);
+    for (int i = 0; i < n_gpu; ++i) {
+      CHECK_EQ(cudaSetDevice(i), cudaSuccess);
+      cuda_mr.push_back(std::make_unique<CUDAMemoryResource>());
+      pool_mr.push_back(std::make_unique<PoolMemoryResource>(cuda_mr[i].get()));
+    }
+    CHECK_EQ(cudaSetDevice(current_device), cudaSuccess);
+  }
+  ~RMMAllocator() = default;
+};
+
+void DeleteRMMResource(RMMAllocator* r) {
+  delete r;
+}
+
+RMMAllocatorPtr SetUpRMMResourceForCppTests(int argc, char** argv) {
+  bool use_rmm_pool = false;
+  for (int i = 1; i < argc; ++i) {
+    if (argv[i] == std::string("--use-rmm-pool")) {
+      use_rmm_pool = true;
+    }
+  }
+  if (!use_rmm_pool) {
+    return RMMAllocatorPtr(nullptr, DeleteRMMResource);
+  }
+  LOG(INFO) << "Using RMM memory pool";
+  auto ptr = RMMAllocatorPtr(new RMMAllocator(), DeleteRMMResource);
+  for (int i = 0; i < ptr->n_gpu; ++i) {
+    rmm::mr::set_per_device_resource(rmm::cuda_device_id(i), ptr->pool_mr[i].get());
+  }
+  return ptr;
+}
+#else  // defined(XGBOOST_USE_RMM) && XGBOOST_USE_RMM == 1
+class RMMAllocator {};
+
+void DeleteRMMResource(RMMAllocator* r) {}
+
+RMMAllocatorPtr SetUpRMMResourceForCppTests(int argc, char** argv) {
+  return RMMAllocatorPtr(nullptr, DeleteRMMResource);
+}
+#endif  // !defined(XGBOOST_USE_RMM) || XGBOOST_USE_RMM != 1
 
 }  // namespace xgboost

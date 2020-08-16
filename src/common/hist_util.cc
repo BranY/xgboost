@@ -113,344 +113,12 @@ void GHistIndexMatrix::ResizeIndex(const size_t rbegin, const SparsePage& batch,
 }
 
 HistogramCuts::HistogramCuts() {
-  monitor_.Init(__FUNCTION__);
   cut_ptrs_.HostVector().emplace_back(0);
 }
 
-// Dispatch to specific builder.
-void HistogramCuts::Build(DMatrix* dmat, uint32_t const max_num_bins) {
-  auto const& info = dmat->Info();
-  size_t const total = info.num_row_ * info.num_col_;
-  size_t const nnz = info.num_nonzero_;
-  float const sparsity = static_cast<float>(nnz) / static_cast<float>(total);
-  // Use a small number to avoid calling `dmat->GetColumnBatches'.
-  float constexpr kSparsityThreshold = 0.0005;
-  // FIXME(trivialfis): Distributed environment is not supported.
-  if (sparsity < kSparsityThreshold && (!rabit::IsDistributed())) {
-    LOG(INFO) << "Building quantile cut on a sparse dataset.";
-    SparseCuts cuts(this);
-    cuts.Build(dmat, max_num_bins);
-  } else {
-    LOG(INFO) << "Building quantile cut on a dense dataset or distributed environment.";
-    DenseCuts cuts(this);
-    cuts.Build(dmat, max_num_bins);
-  }
-  LOG(INFO) << "Total number of hist bins: " << cut_ptrs_.HostVector().back();
-}
-
-bool CutsBuilder::UseGroup(DMatrix* dmat) {
-  auto& info = dmat->Info();
-  size_t const num_groups = info.group_ptr_.size() == 0 ?
-                            0 : info.group_ptr_.size() - 1;
-  // Use group index for weights?
-  bool const use_group_ind = num_groups != 0 &&
-                             (info.weights_.Size() != info.num_row_);
-  return use_group_ind;
-}
-
-void SparseCuts::SingleThreadBuild(SparsePage const& page, MetaInfo const& info,
-                                   uint32_t max_num_bins,
-                                   bool const use_group_ind,
-                                   uint32_t beg_col, uint32_t end_col,
-                                   uint32_t thread_id) {
-  CHECK_GE(end_col, beg_col);
-  constexpr float kFactor = 8;
-
-  // Data groups, used in ranking.
-  std::vector<bst_uint> const& group_ptr = info.group_ptr_;
-  auto &local_min_vals = p_cuts_->min_vals_.HostVector();
-  auto &local_cuts = p_cuts_->cut_values_.HostVector();
-  auto &local_ptrs = p_cuts_->cut_ptrs_.HostVector();
-  local_min_vals.resize(end_col - beg_col, 0);
-
-  for (uint32_t col_id = beg_col; col_id < page.Size() && col_id < end_col; ++col_id) {
-    // Using a local variable makes things easier, but at the cost of memory trashing.
-    WQSketch sketch;
-    common::Span<xgboost::Entry const> const column = page[col_id];
-    uint32_t const n_bins = std::min(static_cast<uint32_t>(column.size()),
-                                     max_num_bins);
-    if (n_bins == 0) {
-      // cut_ptrs_ is initialized with a zero, so there's always an element at the back
-      local_ptrs.emplace_back(local_ptrs.back());
-      continue;
-    }
-
-    sketch.Init(info.num_row_, 1.0 / (n_bins * kFactor));
-    for (auto const& entry : column) {
-      uint32_t weight_ind = 0;
-      if (use_group_ind) {
-        auto row_idx = entry.index;
-        uint32_t group_ind =
-            this->SearchGroupIndFromRow(group_ptr, page.base_rowid + row_idx);
-        weight_ind = group_ind;
-      } else {
-        weight_ind = entry.index;
-      }
-      sketch.Push(entry.fvalue, info.GetWeight(weight_ind));
-    }
-
-    WQSketch::SummaryContainer out_summary;
-    sketch.GetSummary(&out_summary);
-    WQSketch::SummaryContainer summary;
-    summary.Reserve(n_bins + 1);
-    summary.SetPrune(out_summary, n_bins + 1);
-
-    // Can be use data[1] as the min values so that we don't need to
-    // store another array?
-    float mval = summary.data[0].value;
-    local_min_vals[col_id - beg_col]  = mval - (fabs(mval) + 1e-5);
-
-    this->AddCutPoint(summary, max_num_bins);
-
-    bst_float cpt = (summary.size > 0) ?
-                    summary.data[summary.size - 1].value :
-                    local_min_vals[col_id - beg_col];
-    cpt += fabs(cpt) + 1e-5;
-    local_cuts.emplace_back(cpt);
-
-    local_ptrs.emplace_back(local_cuts.size());
-  }
-}
-
-std::vector<size_t> SparseCuts::LoadBalance(SparsePage const& page,
-                                            size_t const nthreads) {
-  /* Some sparse datasets have their mass concentrating on small
-   * number of features.  To avoid wating for a few threads running
-   * forever, we here distirbute different number of columns to
-   * different threads according to number of entries. */
-  size_t const total_entries = page.data.Size();
-  size_t const entries_per_thread = common::DivRoundUp(total_entries, nthreads);
-
-  std::vector<size_t> cols_ptr(nthreads+1, 0);
-  size_t count {0};
-  size_t current_thread {1};
-
-  for (size_t col_id = 0; col_id < page.Size(); ++col_id) {
-    auto const column = page[col_id];
-    cols_ptr[current_thread]++;  // add one column to thread
-    count += column.size();
-    if (count > entries_per_thread + 1) {
-      current_thread++;
-      count = 0;
-      cols_ptr[current_thread] = cols_ptr[current_thread-1];
-    }
-  }
-  // Idle threads.
-  for (; current_thread < cols_ptr.size() - 1; ++current_thread) {
-    cols_ptr[current_thread+1] = cols_ptr[current_thread];
-  }
-
-  return cols_ptr;
-}
-
-void SparseCuts::Build(DMatrix* dmat, uint32_t const max_num_bins) {
-  monitor_.Start(__FUNCTION__);
-  // Use group index for weights?
-  auto use_group = UseGroup(dmat);
-  uint32_t nthreads = omp_get_max_threads();
-  CHECK_GT(nthreads, 0);
-  std::vector<HistogramCuts> cuts_containers(nthreads);
-  std::vector<std::unique_ptr<SparseCuts>> sparse_cuts(nthreads);
-  for (size_t i = 0; i < nthreads; ++i) {
-    sparse_cuts[i].reset(new SparseCuts(&cuts_containers[i]));
-  }
-
-  for (auto const& page : dmat->GetBatches<CSCPage>()) {
-    CHECK_LE(page.Size(), dmat->Info().num_col_);
-    monitor_.Start("Load balance");
-    std::vector<size_t> col_ptr = LoadBalance(page, nthreads);
-    monitor_.Stop("Load balance");
-    // We here decouples the logic between build and parallelization
-    // to simplify things a bit.
-#pragma omp parallel for num_threads(nthreads) schedule(static)
-    for (omp_ulong i = 0; i < nthreads; ++i) {
-      common::Monitor t_monitor;
-      t_monitor.Init("SingleThreadBuild: " + std::to_string(i));
-      t_monitor.Start(std::to_string(i));
-      sparse_cuts[i]->SingleThreadBuild(page, dmat->Info(), max_num_bins, use_group,
-                                        col_ptr[i], col_ptr[i+1], i);
-      t_monitor.Stop(std::to_string(i));
-    }
-
-    this->Concat(sparse_cuts, dmat->Info().num_col_);
-  }
-
-  monitor_.Stop(__FUNCTION__);
-}
-
-void SparseCuts::Concat(
-    std::vector<std::unique_ptr<SparseCuts>> const& cuts, uint32_t n_cols) {
-  monitor_.Start(__FUNCTION__);
-  uint32_t nthreads = omp_get_max_threads();
-  auto &local_min_vals = p_cuts_->min_vals_.HostVector();
-  auto &local_cuts = p_cuts_->cut_values_.HostVector();
-  auto &local_ptrs = p_cuts_->cut_ptrs_.HostVector();
-  local_min_vals.resize(n_cols, std::numeric_limits<float>::max());
-  size_t min_vals_tail = 0;
-
-  for (uint32_t t = 0; t < nthreads; ++t) {
-    auto& thread_min_vals = cuts[t]->p_cuts_->min_vals_.HostVector();
-    auto& thread_cuts = cuts[t]->p_cuts_->cut_values_.HostVector();
-    auto& thread_ptrs = cuts[t]->p_cuts_->cut_ptrs_.HostVector();
-
-    // concat csc pointers.
-    size_t const old_ptr_size = local_ptrs.size();
-    local_ptrs.resize(
-        thread_ptrs.size() + local_ptrs.size() - 1);
-    size_t const new_icp_size = local_ptrs.size();
-    auto tail = local_ptrs[old_ptr_size-1];
-    for (size_t j = old_ptr_size; j < new_icp_size; ++j) {
-      local_ptrs[j] = tail + thread_ptrs[j-old_ptr_size+1];
-    }
-    // concat csc values
-    size_t const old_iv_size = local_cuts.size();
-    local_cuts.resize(
-        thread_cuts.size() + local_cuts.size());
-    size_t const new_iv_size = local_cuts.size();
-    for (size_t j = old_iv_size; j < new_iv_size; ++j) {
-      local_cuts[j] = thread_cuts[j-old_iv_size];
-    }
-    // merge min values
-    for (size_t j = 0; j < thread_min_vals.size(); ++j) {
-       local_min_vals.at(min_vals_tail + j) =
-          std::min(local_min_vals.at(min_vals_tail + j), thread_min_vals.at(j));
-    }
-    min_vals_tail += thread_min_vals.size();
-  }
-  monitor_.Stop(__FUNCTION__);
-}
-
-void DenseCuts::Build(DMatrix* p_fmat, uint32_t max_num_bins) {
-  monitor_.Start(__FUNCTION__);
-  const MetaInfo& info = p_fmat->Info();
-
-  // safe factor for better accuracy
-  constexpr int kFactor = 8;
-  std::vector<WQSketch> sketchs;
-
-  const int nthread = omp_get_max_threads();
-
-  unsigned const nstep =
-      static_cast<unsigned>((info.num_col_ + nthread - 1) / nthread);
-  unsigned const ncol = static_cast<unsigned>(info.num_col_);
-  sketchs.resize(info.num_col_);
-  for (auto& s : sketchs) {
-    s.Init(info.num_row_, 1.0 / (max_num_bins * kFactor));
-  }
-
-  // Data groups, used in ranking.
-  std::vector<bst_uint> const& group_ptr = info.group_ptr_;
-  size_t const num_groups = group_ptr.size() == 0 ? 0 : group_ptr.size() - 1;
-  // Use group index for weights?
-  bool const use_group = UseGroup(p_fmat);
-  const bool isDense = p_fmat->IsDense();
-  for (const auto &batch : p_fmat->GetBatches<SparsePage>()) {
-    size_t group_ind = 0;
-    if (use_group) {
-      group_ind = this->SearchGroupIndFromRow(group_ptr, batch.base_rowid);
-    }
-#pragma omp parallel num_threads(nthread) firstprivate(group_ind, use_group)
-    {
-      CHECK_EQ(nthread, omp_get_num_threads());
-      auto tid = static_cast<unsigned>(omp_get_thread_num());
-      unsigned begin = std::min(nstep * tid, ncol);
-      unsigned end = std::min(nstep * (tid + 1), ncol);
-
-      // do not iterate if no columns are assigned to the thread
-      if (begin < end && end <= ncol) {
-        for (size_t i = 0; i < batch.Size(); ++i) { // NOLINT(*)
-          size_t const ridx = batch.base_rowid + i;
-          SparsePage::Inst const inst = batch[i];
-          if (use_group &&
-              group_ptr[group_ind] == ridx &&
-              // maximum equals to weights.size() - 1
-              group_ind < num_groups - 1) {
-            // move to next group
-            group_ind++;
-          }
-          size_t w_idx = use_group ? group_ind : ridx;
-          auto w = info.GetWeight(w_idx);
-          if (isDense) {
-            auto data = inst.data();
-            for (size_t ii = begin; ii < end; ii++) {
-              sketchs[ii].Push(data[ii].fvalue, w);
-            }
-          } else {
-            for (auto const& entry : inst) {
-              if (entry.index >= begin && entry.index < end) {
-                sketchs[entry.index].Push(entry.fvalue, w);
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  Init(&sketchs, max_num_bins, info.num_row_);
-  monitor_.Stop(__FUNCTION__);
-}
-
-/**
- * \param [in,out]  in_sketchs
- * \param           max_num_bins  The maximum number bins.
- * \param           max_rows      Number of rows in this DMatrix.
- */
-void DenseCuts::Init
-(std::vector<WQSketch>* in_sketchs, uint32_t max_num_bins, size_t max_rows) {
-  monitor_.Start(__func__);
-  std::vector<WQSketch>& sketchs = *in_sketchs;
-
-  // Compute how many cuts samples we need at each node
-  // Do not require more than the number of total rows  in training data
-  // This allows efficient training on wide data
-  size_t global_max_rows = max_rows;
-  rabit::Allreduce<rabit::op::Sum>(&global_max_rows, 1);
-  constexpr int kFactor = 8;
-  size_t intermediate_num_cuts =
-      std::min(global_max_rows, static_cast<size_t>(max_num_bins * kFactor));
-  // gather the histogram data
-  rabit::SerializeReducer<WQSketch::SummaryContainer> sreducer;
-  std::vector<WQSketch::SummaryContainer> summary_array;
-  summary_array.resize(sketchs.size());
-  for (size_t i = 0; i < sketchs.size(); ++i) {
-    WQSketch::SummaryContainer out;
-    sketchs[i].GetSummary(&out);
-    summary_array[i].Reserve(intermediate_num_cuts);
-    summary_array[i].SetPrune(out, intermediate_num_cuts);
-  }
-  CHECK_EQ(summary_array.size(), in_sketchs->size());
-  size_t nbytes = WQSketch::SummaryContainer::CalcMemCost(intermediate_num_cuts);
-  // TODO(chenqin): rabit failure recovery assumes no boostrap onetime call after loadcheckpoint
-  // we need to move this allreduce before loadcheckpoint call in future
-  sreducer.Allreduce(dmlc::BeginPtr(summary_array), nbytes, summary_array.size());
-  p_cuts_->min_vals_.HostVector().resize(sketchs.size());
-
-  for (size_t fid = 0; fid < summary_array.size(); ++fid) {
-    WQSketch::SummaryContainer a;
-    a.Reserve(max_num_bins + 1);
-    a.SetPrune(summary_array[fid], max_num_bins + 1);
-    const bst_float mval = a.data[0].value;
-    p_cuts_->min_vals_.HostVector()[fid] = mval - (fabs(mval) + 1e-5);
-    AddCutPoint(a, max_num_bins);
-    // push a value that is greater than anything
-    const bst_float cpt
-      = (a.size > 0) ? a.data[a.size - 1].value : p_cuts_->min_vals_.HostVector()[fid];
-    // this must be bigger than last value in a scale
-    const bst_float last = cpt + (fabs(cpt) + 1e-5);
-    p_cuts_->cut_values_.HostVector().push_back(last);
-
-    // Ensure that every feature gets at least one quantile point
-    CHECK_LE(p_cuts_->cut_values_.HostVector().size(), std::numeric_limits<uint32_t>::max());
-    auto cut_size = static_cast<uint32_t>(p_cuts_->cut_values_.HostVector().size());
-    CHECK_GT(cut_size, p_cuts_->cut_ptrs_.HostVector().back());
-    p_cuts_->cut_ptrs_.HostVector().push_back(cut_size);
-  }
-  monitor_.Stop(__func__);
-}
-
 void GHistIndexMatrix::Init(DMatrix* p_fmat, int max_bins) {
-  cut.Build(p_fmat, max_bins);
+  cut = SketchOnDMatrix(p_fmat, max_bins);
+
   max_num_bins = max_bins;
   const int32_t nthread = omp_get_max_threads();
   const uint32_t nbins = cut.Ptrs().back();
@@ -830,54 +498,78 @@ void GHistIndexBlockMatrix::Init(const GHistIndexMatrix& gmat,
 /*!
  * \brief fill a histogram by zeros in range [begin, end)
  */
-void InitilizeHistByZeroes(GHistRow hist, size_t begin, size_t end) {
-#if defined(XGBOOST_STRICT_R_MODE) && XGBOOST_STRICT_R_MODE == 1
-  std::fill(hist.begin() + begin, hist.begin() + end, tree::GradStats());
-#else  // defined(XGBOOST_STRICT_R_MODE) && XGBOOST_STRICT_R_MODE == 1
-  memset(hist.data() + begin, '\0', (end-begin)*sizeof(tree::GradStats));
-#endif  // defined(XGBOOST_STRICT_R_MODE) && XGBOOST_STRICT_R_MODE == 1
+template<typename GradientSumT>
+void InitilizeHistByZeroes(GHistRow<GradientSumT> hist, size_t begin, size_t end) {
+  static_assert(sizeof(xgboost::detail::GradientPairInternal<GradientSumT>) %
+                        sizeof(GradientSumT) ==
+                    0,
+                "");
+  auto p_data = reinterpret_cast<GradientSumT*>(hist.data());
+  memset(p_data + begin, '\0', (end-begin)*
+         sizeof(xgboost::detail::GradientPairInternal<GradientSumT>));
 }
+template void InitilizeHistByZeroes(GHistRow<float> hist, size_t begin,
+                                    size_t end);
+template void InitilizeHistByZeroes(GHistRow<double> hist, size_t begin,
+                                    size_t end);
 
 /*!
  * \brief Increment hist as dst += add in range [begin, end)
  */
-void IncrementHist(GHistRow dst, const GHistRow add, size_t begin, size_t end) {
-  using FPType = decltype(tree::GradStats::sum_grad);
-  FPType* pdst = reinterpret_cast<FPType*>(dst.data());
-  const FPType* padd = reinterpret_cast<const FPType*>(add.data());
+template<typename GradientSumT>
+void IncrementHist(GHistRow<GradientSumT> dst, const GHistRow<GradientSumT> add,
+                   size_t begin, size_t end) {
+  GradientSumT* pdst = reinterpret_cast<GradientSumT*>(dst.data());
+  const GradientSumT* padd = reinterpret_cast<const GradientSumT*>(add.data());
 
   for (size_t i = 2 * begin; i < 2 * end; ++i) {
     pdst[i] += padd[i];
   }
 }
+template void IncrementHist(GHistRow<float> dst, const GHistRow<float> add,
+                            size_t begin, size_t end);
+template void IncrementHist(GHistRow<double> dst, const GHistRow<double> add,
+                            size_t begin, size_t end);
 
 /*!
  * \brief Copy hist from src to dst in range [begin, end)
  */
-void CopyHist(GHistRow dst, const GHistRow src, size_t begin, size_t end) {
-  using FPType = decltype(tree::GradStats::sum_grad);
-  FPType* pdst = reinterpret_cast<FPType*>(dst.data());
-  const FPType* psrc = reinterpret_cast<const FPType*>(src.data());
+template<typename GradientSumT>
+void CopyHist(GHistRow<GradientSumT> dst, const GHistRow<GradientSumT> src,
+              size_t begin, size_t end) {
+  GradientSumT* pdst = reinterpret_cast<GradientSumT*>(dst.data());
+  const GradientSumT* psrc = reinterpret_cast<const GradientSumT*>(src.data());
 
   for (size_t i = 2 * begin; i < 2 * end; ++i) {
     pdst[i] = psrc[i];
   }
 }
+template void CopyHist(GHistRow<float> dst, const GHistRow<float> src,
+                       size_t begin, size_t end);
+template void CopyHist(GHistRow<double> dst, const GHistRow<double> src,
+                       size_t begin, size_t end);
 
 /*!
  * \brief Compute Subtraction: dst = src1 - src2 in range [begin, end)
  */
-void SubtractionHist(GHistRow dst, const GHistRow src1, const GHistRow src2,
+template<typename GradientSumT>
+void SubtractionHist(GHistRow<GradientSumT> dst, const GHistRow<GradientSumT> src1,
+                     const GHistRow<GradientSumT> src2,
                      size_t begin, size_t end) {
-  using FPType = decltype(tree::GradStats::sum_grad);
-  FPType* pdst = reinterpret_cast<FPType*>(dst.data());
-  const FPType* psrc1 = reinterpret_cast<const FPType*>(src1.data());
-  const FPType* psrc2 = reinterpret_cast<const FPType*>(src2.data());
+  GradientSumT* pdst = reinterpret_cast<GradientSumT*>(dst.data());
+  const GradientSumT* psrc1 = reinterpret_cast<const GradientSumT*>(src1.data());
+  const GradientSumT* psrc2 = reinterpret_cast<const GradientSumT*>(src2.data());
 
   for (size_t i = 2 * begin; i < 2 * end; ++i) {
     pdst[i] = psrc1[i] - psrc2[i];
   }
 }
+template void SubtractionHist(GHistRow<float> dst, const GHistRow<float> src1,
+                              const GHistRow<float> src2,
+                              size_t begin, size_t end);
+template void SubtractionHist(GHistRow<double> dst, const GHistRow<double> src1,
+                              const GHistRow<double> src2,
+                              size_t begin, size_t end);
 
 struct Prefetch {
  public:
@@ -908,7 +600,7 @@ void BuildHistDenseKernel(const std::vector<GradientPair>& gpair,
                           const RowSetCollection::Elem row_indices,
                           const GHistIndexMatrix& gmat,
                           const size_t n_features,
-                          GHistRow hist) {
+                          GHistRow<FPType> hist) {
   const size_t size = row_indices.Size();
   const size_t* rid = row_indices.begin;
   const float* pgh = reinterpret_cast<const float*>(gpair.data());
@@ -948,7 +640,7 @@ template<typename FPType, bool do_prefetch>
 void BuildHistSparseKernel(const std::vector<GradientPair>& gpair,
                            const RowSetCollection::Elem row_indices,
                            const GHistIndexMatrix& gmat,
-                           GHistRow hist) {
+                           GHistRow<FPType> hist) {
   const size_t size = row_indices.Size();
   const size_t* rid = row_indices.begin;
   const float* pgh = reinterpret_cast<const float*>(gpair.data());
@@ -987,7 +679,7 @@ void BuildHistSparseKernel(const std::vector<GradientPair>& gpair,
 template<typename FPType, bool do_prefetch, typename BinIdxType>
 void BuildHistDispatchKernel(const std::vector<GradientPair>& gpair,
                      const RowSetCollection::Elem row_indices,
-                     const GHistIndexMatrix& gmat, GHistRow hist, bool isDense) {
+                     const GHistIndexMatrix& gmat, GHistRow<FPType> hist, bool isDense) {
   if (isDense) {
     const size_t* row_ptr =  gmat.row_ptr.data();
     const size_t n_features = row_ptr[row_indices.begin[0]+1] - row_ptr[row_indices.begin[0]];
@@ -1002,7 +694,7 @@ void BuildHistDispatchKernel(const std::vector<GradientPair>& gpair,
 template<typename FPType, bool do_prefetch>
 void BuildHistKernel(const std::vector<GradientPair>& gpair,
                      const RowSetCollection::Elem row_indices,
-                     const GHistIndexMatrix& gmat, const bool isDense, GHistRow hist) {
+                     const GHistIndexMatrix& gmat, const bool isDense, GHistRow<FPType> hist) {
   const bool is_dense = row_indices.Size() && isDense;
   switch (gmat.index.GetBinTypeSize()) {
     case kUint8BinsTypeSize:
@@ -1022,12 +714,11 @@ void BuildHistKernel(const std::vector<GradientPair>& gpair,
   }
 }
 
-void GHistBuilder::BuildHist(const std::vector<GradientPair>& gpair,
-                             const RowSetCollection::Elem row_indices,
-                             const GHistIndexMatrix& gmat,
-                             GHistRow hist,
-                             bool isDense) {
-  using FPType = decltype(tree::GradStats::sum_grad);
+template <typename GradientSumT>
+void GHistBuilder<GradientSumT>::BuildHist(
+    const std::vector<GradientPair> &gpair,
+    const RowSetCollection::Elem row_indices, const GHistIndexMatrix &gmat,
+    GHistRowT hist, bool isDense) {
   const size_t nrows = row_indices.Size();
   const size_t no_prefetch_size = Prefetch::NoPrefetchSize(nrows);
 
@@ -1036,21 +727,34 @@ void GHistBuilder::BuildHist(const std::vector<GradientPair>& gpair,
 
   if (contiguousBlock) {
     // contiguous memory access, built-in HW prefetching is enough
-    BuildHistKernel<FPType, false>(gpair, row_indices, gmat, isDense, hist);
+    BuildHistKernel<GradientSumT, false>(gpair, row_indices, gmat, isDense, hist);
   } else {
     const RowSetCollection::Elem span1(row_indices.begin, row_indices.end - no_prefetch_size);
     const RowSetCollection::Elem span2(row_indices.end - no_prefetch_size, row_indices.end);
 
-    BuildHistKernel<FPType, true>(gpair, span1, gmat, isDense, hist);
+    BuildHistKernel<GradientSumT, true>(gpair, span1, gmat, isDense, hist);
     // no prefetching to avoid loading extra memory
-    BuildHistKernel<FPType, false>(gpair, span2, gmat, isDense, hist);
+    BuildHistKernel<GradientSumT, false>(gpair, span2, gmat, isDense, hist);
   }
 }
+template
+void GHistBuilder<float>::BuildHist(const std::vector<GradientPair>& gpair,
+                             const RowSetCollection::Elem row_indices,
+                             const GHistIndexMatrix& gmat,
+                             GHistRow<float> hist,
+                             bool isDense);
+template
+void GHistBuilder<double>::BuildHist(const std::vector<GradientPair>& gpair,
+                             const RowSetCollection::Elem row_indices,
+                             const GHistIndexMatrix& gmat,
+                             GHistRow<double> hist,
+                             bool isDense);
 
-void GHistBuilder::BuildBlockHist(const std::vector<GradientPair>& gpair,
+template<typename GradientSumT>
+void GHistBuilder<GradientSumT>::BuildBlockHist(const std::vector<GradientPair>& gpair,
                                   const RowSetCollection::Elem row_indices,
                                   const GHistIndexBlockMatrix& gmatb,
-                                  GHistRow hist) {
+                                  GHistRowT hist) {
   constexpr int kUnroll = 8;  // loop unrolling factor
   const size_t nblock = gmatb.GetNumBlock();
   const size_t nrows = row_indices.end - row_indices.begin;
@@ -1058,7 +762,7 @@ void GHistBuilder::BuildBlockHist(const std::vector<GradientPair>& gpair,
 #if defined(_OPENMP)
   const auto nthread = static_cast<bst_omp_uint>(this->nthread_);  // NOLINT
 #endif  // defined(_OPENMP)
-  tree::GradStats* p_hist = hist.data();
+  xgboost::detail::GradientPairInternal<GradientSumT>* p_hist = hist.data();
 
 #pragma omp parallel for num_threads(nthread) schedule(guided)
   for (bst_omp_uint bid = 0; bid < nblock; ++bid) {
@@ -1079,7 +783,7 @@ void GHistBuilder::BuildBlockHist(const std::vector<GradientPair>& gpair,
       for (int k = 0; k < kUnroll; ++k) {
         for (size_t j = ibegin[k]; j < iend[k]; ++j) {
           const uint32_t bin = gmat.index[j];
-          p_hist[bin].Add(stat[k]);
+          p_hist[bin].Add(stat[k].GetGrad(), stat[k].GetHess());
         }
       }
     }
@@ -1090,13 +794,27 @@ void GHistBuilder::BuildBlockHist(const std::vector<GradientPair>& gpair,
       const GradientPair stat = gpair[rid];
       for (size_t j = ibegin; j < iend; ++j) {
         const uint32_t bin = gmat.index[j];
-        p_hist[bin].Add(stat);
+        p_hist[bin].Add(stat.GetGrad(), stat.GetHess());
       }
     }
   }
 }
+template
+void GHistBuilder<float>::BuildBlockHist(const std::vector<GradientPair>& gpair,
+                                  const RowSetCollection::Elem row_indices,
+                                  const GHistIndexBlockMatrix& gmatb,
+                                  GHistRow<float> hist);
+template
+void GHistBuilder<double>::BuildBlockHist(const std::vector<GradientPair>& gpair,
+                                  const RowSetCollection::Elem row_indices,
+                                  const GHistIndexBlockMatrix& gmatb,
+                                  GHistRow<double> hist);
 
-void GHistBuilder::SubtractionTrick(GHistRow self, GHistRow sibling, GHistRow parent) {
+
+template<typename GradientSumT>
+void GHistBuilder<GradientSumT>::SubtractionTrick(GHistRowT self,
+                                                  GHistRowT sibling,
+                                                  GHistRowT parent) {
   const size_t size = self.size();
   CHECK_EQ(sibling.size(), size);
   CHECK_EQ(parent.size(), size);
@@ -1111,6 +829,14 @@ void GHistBuilder::SubtractionTrick(GHistRow self, GHistRow sibling, GHistRow pa
     SubtractionHist(self, parent, sibling, ibegin, iend);
   }
 }
+template
+void GHistBuilder<float>::SubtractionTrick(GHistRow<float> self,
+                                           GHistRow<float> sibling,
+                                           GHistRow<float> parent);
+template
+void GHistBuilder<double>::SubtractionTrick(GHistRow<double> self,
+                                            GHistRow<double> sibling,
+                                            GHistRow<double> parent);
 
 }  // namespace common
 }  // namespace xgboost

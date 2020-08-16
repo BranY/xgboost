@@ -17,6 +17,7 @@
 #include <map>
 
 #include "row_set.h"
+#include "common.h"
 #include "threading_utils.h"
 #include "../tree/param.h"
 #include "./quantile.h"
@@ -34,15 +35,8 @@ using GHistIndexRow = Span<uint32_t const>;
 // A CSC matrix representing histogram cuts, used in CPU quantile hist.
 // The cut values represent upper bounds of bins containing approximately equal numbers of elements
 class HistogramCuts {
-  // Using friends to avoid creating a virtual class, since HistogramCuts is used as value
-  // object in many places.
-  friend class SparseCuts;
-  friend class DenseCuts;
-  friend class CutsBuilder;
-
  protected:
   using BinIdx = uint32_t;
-  common::Monitor monitor_;
 
  public:
   HostDeviceVector<bst_float> cut_values_;  // NOLINT
@@ -75,16 +69,12 @@ class HistogramCuts {
   }
 
   HistogramCuts& operator=(HistogramCuts&& that) noexcept(true) {
-    monitor_ = std::move(that.monitor_);
     cut_ptrs_ = std::move(that.cut_ptrs_);
     cut_values_ = std::move(that.cut_values_);
     min_vals_ = std::move(that.min_vals_);
     return *this;
   }
 
-  /* \brief Build histogram cuts. */
-  void Build(DMatrix* dmat, uint32_t const max_num_bins);
-  /* \brief How many bins a feature has. */
   uint32_t FeatureBins(uint32_t feature) const {
     return cut_ptrs_.ConstHostVector().at(feature + 1) -
            cut_ptrs_.ConstHostVector()[feature];
@@ -118,98 +108,42 @@ class HistogramCuts {
   }
 };
 
-/* \brief An interface for building quantile cuts.
- *
- * `DenseCuts' always assumes there are `max_bins` for each feature, which makes it not
- * suitable for sparse dataset.  On the other hand `SparseCuts' uses `GetColumnBatches',
- * which doubles the memory usage, hence can not be applied to dense dataset.
- */
-class CutsBuilder {
- public:
-  using WQSketch = common::WQuantileSketch<bst_float, bst_float>;
-  /* \brief return whether group for ranking is used. */
-  static bool UseGroup(DMatrix* dmat);
-
- protected:
-  HistogramCuts* p_cuts_;
-
- public:
-  explicit CutsBuilder(HistogramCuts* p_cuts) : p_cuts_{p_cuts} {}
-  virtual ~CutsBuilder() = default;
-
-  static uint32_t SearchGroupIndFromRow(
-      std::vector<bst_uint> const& group_ptr, size_t const base_rowid) {
-    using KIt = std::vector<bst_uint>::const_iterator;
-    KIt res = std::lower_bound(group_ptr.cbegin(), group_ptr.cend() - 1, base_rowid);
-    // Cannot use CHECK_NE because it will try to print the iterator.
-    bool const found = res != group_ptr.cend() - 1;
-    if (!found) {
-      LOG(FATAL) << "Row " << base_rowid << " does not lie in any group!";
-    }
-    uint32_t group_ind = std::distance(group_ptr.cbegin(), res);
-    return group_ind;
+inline HistogramCuts SketchOnDMatrix(DMatrix *m, int32_t max_bins) {
+  HistogramCuts out;
+  auto const& info = m->Info();
+  const auto threads = omp_get_max_threads();
+  std::vector<std::vector<bst_row_t>> column_sizes(threads);
+  for (auto& column : column_sizes) {
+    column.resize(info.num_col_, 0);
   }
-
-  void AddCutPoint(WQSketch::SummaryContainer const& summary, int max_bin) {
-    size_t required_cuts = std::min(summary.size, static_cast<size_t>(max_bin));
-    for (size_t i = 1; i < required_cuts; ++i) {
-      bst_float cpt = summary.data[i].value;
-      if (i == 1 || cpt > p_cuts_->cut_values_.ConstHostVector().back()) {
-        p_cuts_->cut_values_.HostVector().push_back(cpt);
+  for (auto const& page : m->GetBatches<SparsePage>()) {
+    page.data.HostVector();
+    page.offset.HostVector();
+    ParallelFor(page.Size(), threads, [&](size_t i) {
+      auto &local_column_sizes = column_sizes.at(omp_get_thread_num());
+      auto row = page[i];
+      auto const *p_row = row.data();
+      for (size_t j = 0; j < row.size(); ++j) {
+        local_column_sizes.at(p_row[j].index)++;
       }
+    });
+  }
+  std::vector<bst_row_t> reduced(info.num_col_, 0);
+
+  ParallelFor(info.num_col_, threads, [&](size_t i) {
+    for (auto const &thread : column_sizes) {
+      reduced[i] += thread[i];
     }
+  });
+
+  HostSketchContainer container(reduced, max_bins,
+                                HostSketchContainer::UseGroup(info));
+  for (auto const &page : m->GetBatches<SparsePage>()) {
+    container.PushRowPage(page, info);
   }
-
-  /* \brief Build histogram indices. */
-  virtual void Build(DMatrix* dmat, uint32_t const max_num_bins) = 0;
-};
-
-/*! \brief Cut configuration for sparse dataset. */
-class SparseCuts : public CutsBuilder {
-  /* \brief Distrbute columns to each thread according to number of entries. */
-  static std::vector<size_t> LoadBalance(SparsePage const& page, size_t const nthreads);
-  Monitor monitor_;
-
- public:
-  explicit SparseCuts(HistogramCuts* container) :
-      CutsBuilder(container) {
-    monitor_.Init(__FUNCTION__);
-  }
-
-  /* \brief Concatonate the built cuts in each thread. */
-  void Concat(std::vector<std::unique_ptr<SparseCuts>> const& cuts, uint32_t n_cols);
-  /* \brief Build histogram indices in single thread. */
-  void SingleThreadBuild(SparsePage const& page, MetaInfo const& info,
-                         uint32_t max_num_bins,
-                         bool const use_group_ind,
-                         uint32_t beg, uint32_t end, uint32_t thread_id);
-  void Build(DMatrix* dmat, uint32_t const max_num_bins) override;
-};
-
-/*! \brief Cut configuration for dense dataset. */
-class DenseCuts  : public CutsBuilder {
- protected:
-  Monitor monitor_;
-
- public:
-  explicit DenseCuts(HistogramCuts* container) :
-      CutsBuilder(container) {
-    monitor_.Init(__FUNCTION__);
-  }
-  void Init(std::vector<WQSketch>* sketchs, uint32_t max_num_bins, size_t max_rows);
-  void Build(DMatrix* p_fmat, uint32_t max_num_bins) override;
-};
-
-// sketch_batch_num_elements 0 means autodetect. Only modify this for testing.
-HistogramCuts DeviceSketch(int device, DMatrix* dmat, int max_bins,
-                           size_t sketch_batch_num_elements = 0);
-
-// sketch_batch_num_elements 0 means autodetect. Only modify this for testing.
-template <typename AdapterT>
-HistogramCuts AdapterDeviceSketch(AdapterT* adapter, int num_bins,
-                                  float missing,
-                                  size_t sketch_batch_num_elements = 0);
-
+  container.MakeCuts(&out);
+  return out;
+}
 
 enum BinTypeSize {
   kUint8BinsTypeSize  = 1,
@@ -401,46 +335,52 @@ class GHistIndexBlockMatrix {
   std::vector<Block> blocks_;
 };
 
-/*!
- * \brief histogram of gradient statistics for a single node.
- *  Consists of multiple GradStats, each entry showing total gradient statistics
- *     for that particular bin
- *  Uses global bin id so as to represent all features simultaneously
- */
-using GHistRow = Span<tree::GradStats>;
+template<typename GradientSumT>
+using GHistRow = Span<xgboost::detail::GradientPairInternal<GradientSumT> >;
 
 /*!
  * \brief fill a histogram by zeros
  */
-void InitilizeHistByZeroes(GHistRow hist, size_t begin, size_t end);
+template<typename GradientSumT>
+void InitilizeHistByZeroes(GHistRow<GradientSumT> hist, size_t begin, size_t end);
 
 /*!
  * \brief Increment hist as dst += add in range [begin, end)
  */
-void IncrementHist(GHistRow dst, const GHistRow add, size_t begin, size_t end);
+template<typename GradientSumT>
+void IncrementHist(GHistRow<GradientSumT> dst, const GHistRow<GradientSumT> add,
+                   size_t begin, size_t end);
 
 /*!
  * \brief Copy hist from src to dst in range [begin, end)
  */
-void CopyHist(GHistRow dst, const GHistRow src, size_t begin, size_t end);
+template<typename GradientSumT>
+void CopyHist(GHistRow<GradientSumT> dst, const GHistRow<GradientSumT> src,
+              size_t begin, size_t end);
 
 /*!
  * \brief Compute Subtraction: dst = src1 - src2 in range [begin, end)
  */
-void SubtractionHist(GHistRow dst, const GHistRow src1, const GHistRow src2,
+template<typename GradientSumT>
+void SubtractionHist(GHistRow<GradientSumT> dst, const GHistRow<GradientSumT> src1,
+                     const GHistRow<GradientSumT> src2,
                      size_t begin, size_t end);
 
 /*!
  * \brief histogram of gradient statistics for multiple nodes
  */
+template<typename GradientSumT>
 class HistCollection {
  public:
+  using GHistRowT = GHistRow<GradientSumT>;
+  using GradientPairT = xgboost::detail::GradientPairInternal<GradientSumT>;
+
   // access histogram for i-th node
-  GHistRow operator[](bst_uint nid) const {
+  GHistRowT operator[](bst_uint nid) const {
     constexpr uint32_t kMax = std::numeric_limits<uint32_t>::max();
     CHECK_NE(row_ptr_[nid], kMax);
-    tree::GradStats* ptr =
-        const_cast<tree::GradStats*>(dmlc::BeginPtr(data_) + row_ptr_[nid]);
+    GradientPairT* ptr =
+        const_cast<GradientPairT*>(dmlc::BeginPtr(data_) + row_ptr_[nid]);
     return {ptr, nbins_};
   }
 
@@ -483,7 +423,7 @@ class HistCollection {
   /*! \brief amount of active nodes in hist collection */
   uint32_t n_nodes_added_ = 0;
 
-  std::vector<tree::GradStats> data_;
+  std::vector<GradientPairT> data_;
 
   /*! \brief row_ptr_[nid] locates bin for histogram of node nid */
   std::vector<size_t> row_ptr_;
@@ -494,8 +434,11 @@ class HistCollection {
  * Supports processing multiple tree-nodes for nested parallelism
  * Able to reduce histograms across threads in efficient way
  */
+template<typename GradientSumT>
 class ParallelGHistBuilder {
  public:
+  using GHistRowT = GHistRow<GradientSumT>;
+
   void Init(size_t nbins) {
     if (nbins != nbins_) {
       hist_buffer_.Init(nbins);
@@ -506,7 +449,7 @@ class ParallelGHistBuilder {
   // Add new elements if needed, mark all hists as unused
   // targeted_hists - already allocated hists which should contain final results after Reduce() call
   void Reset(size_t nthreads, size_t nodes, const BlockedSpace2d& space,
-             const std::vector<GHistRow>& targeted_hists) {
+             const std::vector<GHistRowT>& targeted_hists) {
     hist_buffer_.Init(nbins_);
     tid_nid_to_hist_.clear();
     hist_memory_.clear();
@@ -528,12 +471,12 @@ class ParallelGHistBuilder {
   }
 
   // Get specified hist, initialize hist by zeros if it wasn't used before
-  GHistRow GetInitializedHist(size_t tid, size_t nid) {
+  GHistRowT GetInitializedHist(size_t tid, size_t nid) {
     CHECK_LT(nid, nodes_);
     CHECK_LT(tid, nthreads_);
 
     size_t idx = tid_nid_to_hist_.at({tid, nid});
-    GHistRow hist = hist_memory_[idx];
+    GHistRowT hist = hist_memory_[idx];
 
     if (!hist_was_used_[tid * nodes_ + nid]) {
       InitilizeHistByZeroes(hist, 0, hist.size());
@@ -548,14 +491,14 @@ class ParallelGHistBuilder {
     CHECK_GT(end, begin);
     CHECK_LT(nid, nodes_);
 
-    GHistRow dst = targeted_hists_[nid];
+    GHistRowT dst = targeted_hists_[nid];
 
     bool is_updated = false;
     for (size_t tid = 0; tid < nthreads_; ++tid) {
       if (hist_was_used_[tid * nodes_ + nid]) {
         is_updated = true;
         const size_t idx = tid_nid_to_hist_.at({tid, nid});
-        GHistRow src = hist_memory_[idx];
+        GHistRowT src = hist_memory_[idx];
 
         if (dst.data() != src.data()) {
           IncrementHist(dst, src, begin, end);
@@ -646,7 +589,7 @@ class ParallelGHistBuilder {
   /*! \brief number of nodes which will be processed in parallel  */
   size_t nodes_ = 0;
   /*! \brief Buffer for additional histograms for Parallel processing  */
-  HistCollection hist_buffer_;
+  HistCollection<GradientSumT> hist_buffer_;
   /*!
    * \brief Marks which hists were used, it means that they should be merged.
    * Contains only {true or false} values
@@ -657,9 +600,9 @@ class ParallelGHistBuilder {
   /*! \brief Buffer for additional histograms for Parallel processing  */
   std::vector<bool> threads_to_nids_map_;
   /*! \brief Contains histograms for final results  */
-  std::vector<GHistRow> targeted_hists_;
+  std::vector<GHistRowT> targeted_hists_;
   /*! \brief Allocated memory for histograms used for construction  */
-  std::vector<GHistRow> hist_memory_;
+  std::vector<GHistRowT> hist_memory_;
   /*! \brief map pair {tid, nid} to index of allocated histogram from hist_memory_  */
   std::map<std::pair<size_t, size_t>, size_t> tid_nid_to_hist_;
 };
@@ -667,8 +610,11 @@ class ParallelGHistBuilder {
 /*!
  * \brief builder for histograms of gradient statistics
  */
+template<typename GradientSumT>
 class GHistBuilder {
  public:
+  using GHistRowT = GHistRow<GradientSumT>;
+
   GHistBuilder() = default;
   GHistBuilder(size_t nthread, uint32_t nbins) : nthread_{nthread}, nbins_{nbins} {}
 
@@ -676,15 +622,17 @@ class GHistBuilder {
   void BuildHist(const std::vector<GradientPair>& gpair,
                  const RowSetCollection::Elem row_indices,
                  const GHistIndexMatrix& gmat,
-                 GHistRow hist,
+                 GHistRowT hist,
                  bool isDense);
   // same, with feature grouping
   void BuildBlockHist(const std::vector<GradientPair>& gpair,
                       const RowSetCollection::Elem row_indices,
                       const GHistIndexBlockMatrix& gmatb,
-                      GHistRow hist);
+                      GHistRowT hist);
   // construct a histogram via subtraction trick
-  void SubtractionTrick(GHistRow self, GHistRow sibling, GHistRow parent);
+  void SubtractionTrick(GHistRowT self,
+                        GHistRowT sibling,
+                        GHistRowT parent);
 
   uint32_t GetNumBins() const {
       return nbins_;

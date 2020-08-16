@@ -9,7 +9,7 @@
 
 #include <dmlc/base.h>
 #include <dmlc/data.h>
-#include <rabit/rabit.h>
+#include <dmlc/serializer.h>
 #include <xgboost/base.h>
 #include <xgboost/span.h>
 #include <xgboost/host_device_vector.h>
@@ -30,7 +30,12 @@ enum class DataType : uint8_t {
   kFloat32 = 1,
   kDouble = 2,
   kUInt32 = 3,
-  kUInt64 = 4
+  kUInt64 = 4,
+  kStr = 5
+};
+
+enum class FeatureType : uint8_t {
+  kNumerical
 };
 
 /*!
@@ -39,7 +44,7 @@ enum class DataType : uint8_t {
 class MetaInfo {
  public:
   /*! \brief number of data fields in MetaInfo */
-  static constexpr uint64_t kNumField = 9;
+  static constexpr uint64_t kNumField = 11;
 
   /*! \brief number of rows in the data */
   uint64_t num_row_{0};  // NOLINT
@@ -70,6 +75,19 @@ class MetaInfo {
    * \brief upper bound of the label, to be used for survival analysis (censored regression)
    */
   HostDeviceVector<bst_float> labels_upper_bound_;  // NOLINT
+
+  /*!
+   * \brief Name of type for each feature provided by users. Eg. "int"/"float"/"i"/"q"
+   */
+  std::vector<std::string> feature_type_names;
+  /*!
+   * \brief Name for each feature.
+   */
+  std::vector<std::string> feature_names;
+  /*
+   * \brief Type of each feature.  Automatically set when feature_type_names is specifed.
+   */
+  HostDeviceVector<FeatureType> feature_types;
 
   /*! \brief default constructor */
   MetaInfo()  = default;
@@ -102,7 +120,7 @@ class MetaInfo {
   /*!
    * \brief Validate all metainfo.
    */
-  void Validate() const;
+  void Validate(int32_t device) const;
 
   MetaInfo Slice(common::Span<int32_t const> ridxs) const;
   /*!
@@ -157,6 +175,22 @@ class MetaInfo {
    */
   void SetInfo(const char* key, std::string const& interface_str);
 
+  void GetInfo(char const* key, bst_ulong* out_len, DataType dtype,
+               const void** out_dptr) const;
+
+  void SetFeatureInfo(const char *key, const char **info, const bst_ulong size);
+  void GetFeatureInfo(const char *field, std::vector<std::string>* out_str_vecs) const;
+
+  /*
+   * \brief Extend with other MetaInfo.
+   *
+   * \param that The other MetaInfo object.
+   *
+   * \param accumulate_rows Whether rows need to be accumulated in this function.  If
+   *        client code knows number of rows in advance, set this parameter to false.
+   */
+  void Extend(MetaInfo const& that, bool accumulate_rows);
+
  private:
   /*! \brief argsort of labels */
   mutable std::vector<size_t> label_order_cache_;
@@ -204,6 +238,21 @@ struct BatchParam {
   }
 };
 
+struct HostSparsePageView {
+  using Inst = common::Span<Entry const>;
+
+  common::Span<bst_row_t const> offset;
+  common::Span<Entry const> data;
+
+  Inst operator[](size_t i) const {
+    auto size = *(offset.data() + i + 1) - *(offset.data() + i);
+    return {data.data() + *(offset.data() + i),
+            static_cast<Inst::index_type>(size)};
+  }
+
+  size_t Size() const { return offset.size() == 0 ? 0 : offset.size() - 1; }
+};
+
 /*!
  * \brief In-memory storage unit of sparse batch, stored in CSR format.
  */
@@ -223,17 +272,15 @@ class SparsePage {
   inline Inst operator[](size_t i) const {
     const auto& data_vec = data.HostVector();
     const auto& offset_vec = offset.HostVector();
-    size_t size;
-    // in distributed mode, some partitions may not get any instance for a feature. Therefore
-    // we should set the size as zero
-    if (rabit::IsDistributed() && i + 1 >= offset_vec.size()) {
-      size = 0;
-    } else {
-      size = offset_vec[i + 1] - offset_vec[i];
-    }
+    size_t size = offset_vec[i + 1] - offset_vec[i];
     return {data_vec.data() + offset_vec[i],
             static_cast<Inst::index_type>(size)};
   }
+
+  HostSparsePageView GetView() const {
+    return {offset.ConstHostSpan(), data.ConstHostSpan()};
+  }
+
 
   /*! \brief constructor */
   SparsePage() {
@@ -350,6 +397,8 @@ class EllpackPage {
   /*! \brief Destructor. */
   ~EllpackPage();
 
+  EllpackPage(EllpackPage&& that);
+
   /*! \return Number of instances in the page. */
   size_t Size() const;
 
@@ -419,33 +468,10 @@ class BatchSet {
   BatchIterator<T> begin_iter_;
 };
 
-/*!
- * \brief This is data structure that user can pass to DMatrix::Create
- *  to create a DMatrix for training, user can create this data structure
- *  for customized Data Loading on single machine.
- *
- *  On distributed setting, usually an customized dmlc::Parser is needed instead.
- */
-template<typename T>
-class DataSource : public dmlc::DataIter<T> {
- public:
-  /*!
-   * \brief Meta information about the dataset
-   * The subclass need to be able to load this correctly from data.
-   */
-  MetaInfo info;
-};
+struct XGBAPIThreadLocalEntry;
 
 /*!
  * \brief Internal data structured used by XGBoost during training.
- *  There are two ways to create a customized DMatrix that reads in user defined-format.
- *
- *  - Provide a dmlc::Parser and pass into the DMatrix::Create
- *  - Alternatively, if data can be represented by an URL, define a new dmlc::Parser and register by
- *    DMLC_REGISTER_DATA_PARSER;
- *      - This works best for user defined data input source, such as data-base, filesystem.
- *  - Provide a DataSource, that can be passed to DMatrix::Create
- *      This can be used to re-use inmemory data structure into DMatrix.
  */
 class DMatrix {
  public:
@@ -453,8 +479,19 @@ class DMatrix {
   DMatrix()  = default;
   /*! \brief meta information of the dataset */
   virtual MetaInfo& Info() = 0;
+  virtual void SetInfo(const char *key, const void *dptr, DataType dtype,
+                       size_t num) {
+    this->Info().SetInfo(key, dptr, dtype, num);
+  }
+  virtual void SetInfo(const char* key, std::string const& interface_str) {
+    this->Info().SetInfo(key, interface_str);
+  }
   /*! \brief meta information of the dataset */
   virtual const MetaInfo& Info() const = 0;
+
+  /*! \brief Get thread local memory for returning data from DMatrix. */
+  XGBAPIThreadLocalEntry& GetThreadLocal() const;
+
   /**
    * \brief Gets batches. Use range based for loop over BatchSet to access individual batches.
    */
@@ -467,7 +504,7 @@ class DMatrix {
   /*! \return Whether the data columns single column block. */
   virtual bool SingleColBlock() const = 0;
   /*! \brief virtual destructor */
-  virtual ~DMatrix() = default;
+  virtual ~DMatrix();
 
   /*! \brief Whether the matrix is dense. */
   bool IsDense() const {
@@ -507,7 +544,33 @@ class DMatrix {
                          const std::string& cache_prefix = "",
                          size_t page_size = kPageSize);
 
-  virtual DMatrix* Slice(common::Span<int32_t const> ridxs) = 0;
+  /**
+   * \brief Create a new Quantile based DMatrix used for histogram based algorithm.
+   *
+   * \tparam DataIterHandle         External iterator type, defined in C API.
+   * \tparam DMatrixHandle          DMatrix handle, defined in C API.
+   * \tparam DataIterResetCallback  Callback for reset, prototype defined in C API.
+   * \tparam XGDMatrixCallbackNext  Callback for next, prototype defined in C API.
+   *
+   * \param iter    External data iterator
+   * \param proxy   A hanlde to ProxyDMatrix
+   * \param reset   Callback for reset
+   * \param next    Callback for next
+   * \param missing Value that should be treated as missing.
+   * \param nthread number of threads used for initialization.
+   * \param max_bin Maximum number of bins.
+   *
+   * \return A created quantile based DMatrix.
+   */
+  template <typename DataIterHandle, typename DMatrixHandle,
+            typename DataIterResetCallback, typename XGDMatrixCallbackNext>
+  static DMatrix *Create(DataIterHandle iter, DMatrixHandle proxy,
+                         DataIterResetCallback *reset,
+                         XGDMatrixCallbackNext *next, float missing,
+                         int nthread,
+                         int max_bin);
+
+      virtual DMatrix *Slice(common::Span<int32_t const> ridxs) = 0;
   /*! \brief page size 32 MB */
   static const size_t kPageSize = 32UL << 20UL;
 
@@ -554,5 +617,21 @@ inline BatchSet<EllpackPage> DMatrix::GetBatches(const BatchParam& param) {
 
 namespace dmlc {
 DMLC_DECLARE_TRAITS(is_pod, xgboost::Entry, true);
-}
+
+namespace serializer {
+
+template <>
+struct Handler<xgboost::Entry> {
+  inline static void Write(Stream* strm, const xgboost::Entry& data) {
+    strm->Write(data.index);
+    strm->Write(data.fvalue);
+  }
+
+  inline static bool Read(Stream* strm, xgboost::Entry* data) {
+    return strm->Read(&data->index) && strm->Read(&data->fvalue);
+  }
+};
+
+}  // namespace serializer
+}  // namespace dmlc
 #endif  // XGBOOST_DATA_H_

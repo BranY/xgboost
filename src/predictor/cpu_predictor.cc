@@ -44,18 +44,16 @@ bst_float PredValue(const SparsePage::Inst &inst,
 
 template <size_t kUnrollLen = 8>
 struct SparsePageView {
-  SparsePage const* page;
   bst_row_t base_rowid;
+  HostSparsePageView view;
   static size_t constexpr kUnroll = kUnrollLen;
 
   explicit SparsePageView(SparsePage const *p)
-      : page{p}, base_rowid{page->base_rowid} {
-    // Pull to host before entering omp block, as this is not thread safe.
-    page->data.HostVector();
-    page->offset.HostVector();
+      : base_rowid{p->base_rowid} {
+    view = p->GetView();
   }
-  SparsePage::Inst operator[](size_t i) { return (*page)[i]; }
-  size_t Size() const { return page->Size(); }
+  SparsePage::Inst operator[](size_t i) { return view[i]; }
+  size_t Size() const { return view.Size(); }
 };
 
 template <typename Adapter, size_t kUnrollLen = 8>
@@ -271,12 +269,12 @@ class CPUPredictor : public Predictor {
                                 PredictionCacheEntry *out_preds,
                                 uint32_t tree_begin, uint32_t tree_end) const {
     auto threads = omp_get_max_threads();
-    auto m = dmlc::get<Adapter>(x);
-    CHECK_EQ(m.NumColumns(), model.learner_model_param->num_feature)
+    auto m = dmlc::get<std::shared_ptr<Adapter>>(x);
+    CHECK_EQ(m->NumColumns(), model.learner_model_param->num_feature)
         << "Number of columns in data must equal to trained model.";
     MetaInfo info;
-    info.num_col_ = m.NumColumns();
-    info.num_row_ = m.NumRows();
+    info.num_col_ = m->NumColumns();
+    info.num_row_ = m->NumRows();
     this->InitOutPredictions(info, &(out_preds->predictions), model);
     std::vector<Entry> workspace(info.num_col_ * 8 * threads);
     auto &predictions = out_preds->predictions.HostVector();
@@ -284,17 +282,17 @@ class CPUPredictor : public Predictor {
     InitThreadTemp(threads, model.learner_model_param->num_feature, &thread_temp);
     size_t constexpr kUnroll = 8;
     PredictBatchKernel(AdapterView<Adapter, kUnroll>(
-                           &m, missing, common::Span<Entry>{workspace}),
+                           m.get(), missing, common::Span<Entry>{workspace}),
                        &predictions, model, tree_begin, tree_end, &thread_temp);
   }
 
   void InplacePredict(dmlc::any const &x, const gbm::GBTreeModel &model,
                       float missing, PredictionCacheEntry *out_preds,
                       uint32_t tree_begin, unsigned tree_end) const override {
-    if (x.type() == typeid(data::DenseAdapter)) {
+    if (x.type() == typeid(std::shared_ptr<data::DenseAdapter>)) {
       this->DispatchedInplacePredict<data::DenseAdapter>(
           x, model, missing, out_preds, tree_begin, tree_end);
-    } else if (x.type() == typeid(data::CSRAdapter)) {
+    } else if (x.type() == typeid(std::shared_ptr<data::CSRAdapter>)) {
       this->DispatchedInplacePredict<data::CSRAdapter>(
           x, model, missing, out_preds, tree_begin, tree_end);
     } else {

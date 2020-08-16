@@ -117,14 +117,18 @@ struct EllpackLoader {
   }
 };
 
-struct CuPyAdapterLoader {
-  data::CupyAdapterBatch batch;
+template <typename Batch>
+struct DeviceAdapterLoader {
+  Batch batch;
   bst_feature_t columns;
   float* smem;
   bool use_shared;
 
-  DEV_INLINE CuPyAdapterLoader(data::CupyAdapterBatch const batch, bool use_shared,
-                               bst_feature_t num_features, bst_row_t num_rows, size_t entry_start) :
+  using BatchT = Batch;
+
+  DEV_INLINE DeviceAdapterLoader(Batch const batch, bool use_shared,
+                                 bst_feature_t num_features, bst_row_t num_rows,
+                                 size_t entry_start) :
     batch{batch},
     columns{num_features},
     use_shared{use_shared} {
@@ -151,39 +155,6 @@ struct CuPyAdapterLoader {
       return smem[threadIdx.x * columns + fidx];
     }
     return batch.GetElement(ridx * columns + fidx).value;
-  }
-};
-
-struct CuDFAdapterLoader {
-  data::CudfAdapterBatch batch;
-  bst_feature_t columns;
-  float* smem;
-  bool use_shared;
-
-  DEV_INLINE CuDFAdapterLoader(data::CudfAdapterBatch const batch, bool use_shared,
-                               bst_feature_t num_features,
-                               bst_row_t num_rows, size_t entry_start)
-      : batch{batch}, columns{num_features}, use_shared{use_shared} {
-    extern __shared__ float _smem[];
-    smem = _smem;
-    if (use_shared) {
-      uint32_t global_idx = blockDim.x * blockIdx.x + threadIdx.x;
-      size_t shared_elements = blockDim.x * num_features;
-      dh::BlockFill(smem, shared_elements, nanf(""));
-      __syncthreads();
-      if (global_idx < num_rows) {
-        for (size_t i = 0; i < columns; ++i) {
-          smem[threadIdx.x * columns + i] = batch.GetValue(global_idx, i);
-        }
-      }
-    }
-    __syncthreads();
-  }
-  DEV_INLINE float GetFvalue(bst_row_t ridx, bst_feature_t fidx) const {
-    if (use_shared) {
-      return smem[threadIdx.x * columns + fidx];
-    }
-    return batch.GetValue(ridx, fidx);
   }
 };
 
@@ -242,39 +213,21 @@ __global__ void PredictKernel(Data data,
 
 class DeviceModel {
  public:
-  dh::device_vector<RegTree::Node> nodes;
-  dh::device_vector<size_t> tree_segments;
-  dh::device_vector<int> tree_group;
+  // Need to lazily construct the vectors because GPU id is only known at runtime
+  HostDeviceVector<RegTree::Node> nodes;
+  HostDeviceVector<size_t> tree_segments;
+  HostDeviceVector<int> tree_group;
   size_t tree_beg_;  // NOLINT
   size_t tree_end_;  // NOLINT
   int num_group;
 
-  void CopyModel(const gbm::GBTreeModel& model,
-                 const thrust::host_vector<size_t>& h_tree_segments,
-                 const thrust::host_vector<RegTree::Node>& h_nodes,
-                 size_t tree_begin, size_t tree_end) {
-    nodes.resize(h_nodes.size());
-    dh::safe_cuda(cudaMemcpyAsync(nodes.data().get(), h_nodes.data(),
-                                  sizeof(RegTree::Node) * h_nodes.size(),
-                                  cudaMemcpyHostToDevice));
-    tree_segments.resize(h_tree_segments.size());
-    dh::safe_cuda(cudaMemcpyAsync(tree_segments.data().get(), h_tree_segments.data(),
-                                  sizeof(size_t) * h_tree_segments.size(),
-                                  cudaMemcpyHostToDevice));
-    tree_group.resize(model.tree_info.size());
-    dh::safe_cuda(cudaMemcpyAsync(tree_group.data().get(), model.tree_info.data(),
-                                  sizeof(int) * model.tree_info.size(),
-                                  cudaMemcpyHostToDevice));
-    this->tree_beg_ = tree_begin;
-    this->tree_end_ = tree_end;
-    this->num_group = model.learner_model_param->num_output_group;
-  }
-
   void Init(const gbm::GBTreeModel& model, size_t tree_begin, size_t tree_end, int32_t gpu_id) {
     dh::safe_cuda(cudaSetDevice(gpu_id));
+
     CHECK_EQ(model.param.size_leaf_vector, 0);
     // Copy decision trees to device
-    thrust::host_vector<size_t> h_tree_segments{};
+    tree_segments = std::move(HostDeviceVector<size_t>({}, gpu_id));
+    auto& h_tree_segments = tree_segments.HostVector();
     h_tree_segments.reserve((tree_end - tree_begin) + 1);
     size_t sum = 0;
     h_tree_segments.push_back(sum);
@@ -283,13 +236,21 @@ class DeviceModel {
       h_tree_segments.push_back(sum);
     }
 
-    thrust::host_vector<RegTree::Node> h_nodes(h_tree_segments.back());
+    nodes = std::move(HostDeviceVector<RegTree::Node>(h_tree_segments.back(), RegTree::Node(),
+                                                      gpu_id));
+    auto& h_nodes = nodes.HostVector();
     for (auto tree_idx = tree_begin; tree_idx < tree_end; tree_idx++) {
       auto& src_nodes = model.trees.at(tree_idx)->GetNodes();
       std::copy(src_nodes.begin(), src_nodes.end(),
                 h_nodes.begin() + h_tree_segments[tree_idx - tree_begin]);
     }
-    CopyModel(model, h_tree_segments, h_nodes, tree_begin, tree_end);
+
+    tree_group = std::move(HostDeviceVector<int>(model.tree_info.size(), 0, gpu_id));
+    auto& h_tree_group = tree_group.HostVector();
+    std::memcpy(h_tree_group.data(), model.tree_info.data(), sizeof(int) * model.tree_info.size());
+    this->tree_beg_ = tree_begin;
+    this->tree_end_ = tree_end;
+    this->num_group = model.learner_model_param->num_output_group;
   }
 };
 
@@ -316,8 +277,8 @@ class GPUPredictor : public xgboost::Predictor {
     dh::LaunchKernel {GRID_SIZE, BLOCK_THREADS, shared_memory_bytes} (
         PredictKernel<SparsePageLoader, SparsePageView>,
         data,
-        dh::ToSpan(model_.nodes), predictions->DeviceSpan().subspan(batch_offset),
-        dh::ToSpan(model_.tree_segments), dh::ToSpan(model_.tree_group),
+        model_.nodes.DeviceSpan(), predictions->DeviceSpan().subspan(batch_offset),
+        model_.tree_segments.DeviceSpan(), model_.tree_group.DeviceSpan(),
         model_.tree_beg_, model_.tree_end_, num_features, num_rows,
         entry_start, use_shared, model_.num_group);
   }
@@ -332,8 +293,8 @@ class GPUPredictor : public xgboost::Predictor {
     dh::LaunchKernel {GRID_SIZE, BLOCK_THREADS} (
         PredictKernel<EllpackLoader, EllpackDeviceAccessor>,
         batch,
-        dh::ToSpan(model_.nodes), out_preds->DeviceSpan().subspan(batch_offset),
-        dh::ToSpan(model_.tree_segments), dh::ToSpan(model_.tree_group),
+        model_.nodes.DeviceSpan(), out_preds->DeviceSpan().subspan(batch_offset),
+        model_.tree_segments.DeviceSpan(), model_.tree_group.DeviceSpan(),
         model_.tree_beg_, model_.tree_end_, batch.NumFeatures(), num_rows,
         entry_start, use_shared, model_.num_group);
   }
@@ -428,7 +389,7 @@ class GPUPredictor : public xgboost::Predictor {
           out_preds->Size() == dmat->Info().num_row_);
   }
 
-  template <typename Adapter, typename Loader, typename Batch>
+  template <typename Adapter, typename Loader>
   void DispatchedInplacePredict(dmlc::any const &x,
                                 const gbm::GBTreeModel &model, float missing,
                                 PredictionCacheEntry *out_preds,
@@ -438,22 +399,22 @@ class GPUPredictor : public xgboost::Predictor {
     DeviceModel d_model;
     d_model.Init(model, tree_begin, tree_end, this->generic_param_->gpu_id);
 
-    auto m = dmlc::get<Adapter>(x);
-    CHECK_EQ(m.NumColumns(), model.learner_model_param->num_feature)
+    auto m = dmlc::get<std::shared_ptr<Adapter>>(x);
+    CHECK_EQ(m->NumColumns(), model.learner_model_param->num_feature)
         << "Number of columns in data must equal to trained model.";
-    CHECK_EQ(this->generic_param_->gpu_id, m.DeviceIdx())
+    CHECK_EQ(this->generic_param_->gpu_id, m->DeviceIdx())
         << "XGBoost is running on device: " << this->generic_param_->gpu_id << ", "
-        << "but data is on: " << m.DeviceIdx();
+        << "but data is on: " << m->DeviceIdx();
     MetaInfo info;
-    info.num_col_ = m.NumColumns();
-    info.num_row_ = m.NumRows();
+    info.num_col_ = m->NumColumns();
+    info.num_row_ = m->NumRows();
     this->InitOutPredictions(info, &(out_preds->predictions), model);
 
     const uint32_t BLOCK_THREADS = 128;
     auto GRID_SIZE = static_cast<uint32_t>(common::DivRoundUp(info.num_row_, BLOCK_THREADS));
 
     auto shared_memory_bytes =
-        static_cast<size_t>(sizeof(float) * m.NumColumns() * BLOCK_THREADS);
+        static_cast<size_t>(sizeof(float) * m->NumColumns() * BLOCK_THREADS);
     bool use_shared = true;
     if (shared_memory_bytes > max_shared_memory_bytes) {
       shared_memory_bytes = 0;
@@ -462,22 +423,24 @@ class GPUPredictor : public xgboost::Predictor {
     size_t entry_start = 0;
 
     dh::LaunchKernel {GRID_SIZE, BLOCK_THREADS, shared_memory_bytes} (
-        PredictKernel<Loader, Batch>,
-        m.Value(),
-        dh::ToSpan(d_model.nodes), out_preds->predictions.DeviceSpan(),
-        dh::ToSpan(d_model.tree_segments), dh::ToSpan(d_model.tree_group),
-        tree_begin, tree_end, m.NumColumns(), info.num_row_,
+        PredictKernel<Loader, typename Loader::BatchT>,
+        m->Value(),
+        d_model.nodes.DeviceSpan(), out_preds->predictions.DeviceSpan(),
+        d_model.tree_segments.DeviceSpan(), d_model.tree_group.DeviceSpan(),
+        tree_begin, tree_end, m->NumColumns(), info.num_row_,
         entry_start, use_shared, output_groups);
   }
 
   void InplacePredict(dmlc::any const &x, const gbm::GBTreeModel &model,
                       float missing, PredictionCacheEntry *out_preds,
                       uint32_t tree_begin, unsigned tree_end) const override {
-    if (x.type() == typeid(data::CupyAdapter)) {
-      this->DispatchedInplacePredict<data::CupyAdapter, CuPyAdapterLoader, data::CupyAdapterBatch>(
+    if (x.type() == typeid(std::shared_ptr<data::CupyAdapter>)) {
+      this->DispatchedInplacePredict<
+          data::CupyAdapter, DeviceAdapterLoader<data::CupyAdapterBatch>>(
           x, model, missing, out_preds, tree_begin, tree_end);
-    } else if (x.type() == typeid(data::CudfAdapter)) {
-      this->DispatchedInplacePredict<data::CudfAdapter, CuDFAdapterLoader, data::CudfAdapterBatch>(
+    } else if (x.type() == typeid(std::shared_ptr<data::CudfAdapter>)) {
+      this->DispatchedInplacePredict<
+          data::CudfAdapter, DeviceAdapterLoader<data::CudfAdapterBatch>>(
           x, model, missing, out_preds, tree_begin, tree_end);
     } else {
       LOG(FATAL) << "Only CuPy and CuDF are supported by GPU Predictor.";

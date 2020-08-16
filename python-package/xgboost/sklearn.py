@@ -77,7 +77,7 @@ __model_doc = '''
     gamma : float
         Minimum loss reduction required to make a further partition on a leaf
         node of the tree.
-    min_child_weight : int
+    min_child_weight : float
         Minimum sum of instance weight(hessian) needed in a child.
     max_delta_step : int
         Maximum delta step we allow each tree's weight estimation to be.
@@ -246,7 +246,7 @@ class XGBModel(XGBModelBase):
 
     def _more_tags(self):
         '''Tags used for scikit-learn data validation.'''
-        return {'allow_nan': True}
+        return {'allow_nan': True, 'no_validation': True}
 
     def get_booster(self):
         """Get the underlying xgboost Booster of this model.
@@ -258,7 +258,8 @@ class XGBModel(XGBModelBase):
         booster : a xgboost booster of underlying model
         """
         if not hasattr(self, '_Booster'):
-            raise XGBoostError('need to call fit or load_model beforehand')
+            from sklearn.exceptions import NotFittedError
+            raise NotFittedError('need to call fit or load_model beforehand')
         return self._Booster
 
     def set_params(self, **params):
@@ -332,7 +333,7 @@ class XGBModel(XGBModelBase):
             for k, v in internal.items():
                 if k in params.keys() and params[k] is None:
                     params[k] = parse_parameter(v)
-        except XGBoostError:
+        except ValueError:
             pass
         return params
 
@@ -498,6 +499,8 @@ class XGBModel(XGBModelBase):
 
                 [xgb.callback.reset_learning_rate(custom_rates)]
         """
+        self.n_features_in_ = X.shape[1]
+
         train_dmatrix = DMatrix(data=X, label=y, weight=sample_weight,
                                 base_margin=base_margin,
                                 missing=self.missing,
@@ -539,7 +542,8 @@ class XGBModel(XGBModelBase):
         self._Booster = train(params, train_dmatrix,
                               self.get_num_boosting_rounds(), evals=evals,
                               early_stopping_rounds=early_stopping_rounds,
-                              evals_result=evals_result, obj=obj, feval=feval,
+                              evals_result=evals_result,
+                              obj=obj, feval=feval,
                               verbose_eval=verbose, xgb_model=xgb_model,
                               callbacks=callbacks)
 
@@ -810,7 +814,10 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
             # different ways of reshaping
             raise ValueError(
                 'Please reshape the input data X into 2-dimensional matrix.')
+
         self._features_count = X.shape[1]
+        self.n_features_in_ = self._features_count
+
         train_dmatrix = DMatrix(X, label=training_labels, weight=sample_weight,
                                 base_margin=base_margin,
                                 missing=self.missing, nthread=self.n_jobs)
@@ -902,7 +909,7 @@ class XGBClassifier(XGBModel, XGBClassifierBase):
             'Label encoder is not defined.  Returning class probability.')
         return class_probs
 
-    def predict_proba(self, data, ntree_limit=None, validate_features=True,
+    def predict_proba(self, data, ntree_limit=None, validate_features=False,
                       base_margin=None):
         """
         Predict the probability of each `data` example being of a given class.
@@ -1192,6 +1199,8 @@ class XGBRanker(XGBModel):
             ret = DMatrix(**params)
             ret.set_group(group)
             return ret
+
+        self.n_features_in_ = X.shape[1]
 
         train_dmatrix = DMatrix(data=X, label=y, weight=sample_weight,
                                 base_margin=base_margin,
