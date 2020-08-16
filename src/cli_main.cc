@@ -362,7 +362,7 @@ class CLI {
   }
 
   void SaveModel(std::string const& path, Learner* learner) const {
-    learner->Configure();
+    learner->Configure(); 
     std::unique_ptr<dmlc::Stream> fo(dmlc::Stream::Create(path.c_str(), "w"));
     if (common::FileExtension(path) == "json") {
       Json out{Object()};
@@ -522,5 +522,4 @@ int main(int argc, char *argv[]) {
     xgboost::CLIError(e);
     return 1;
   }
-  return 0;
 }
